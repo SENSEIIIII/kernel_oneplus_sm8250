@@ -2365,7 +2365,7 @@ void add_hwgenerator_randomness(const char *buffer, size_t count,
 		crng_fast_load(buffer, count);
 		return;
 	}
-
+	
 	/* Suspend writing if we're above the trickle threshold.
 	 * We'll be woken up again once below random_write_wakeup_thresh,
 	 * or when the calling thread is about to terminate.
@@ -2392,4 +2392,5 @@ void add_bootloader_randomness(const void *buf, unsigned int size)
 	else
 		add_device_randomness(buf, size);
 }
+EXPORT_SYMBOL_GPL(add_bootloader_randomness);
 EXPORT_SYMBOL_GPL(add_bootloader_randomness);
