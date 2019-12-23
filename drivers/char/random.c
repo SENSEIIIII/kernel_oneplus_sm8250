@@ -759,7 +759,6 @@ retry:
 		if (entropy_bits >= random_read_wakeup_bits &&
 		    wq_has_sleeper(&random_read_wait)) {
 			wake_up_interruptible(&random_read_wait);
-			kill_fasync(&fasync, SIGIO, POLL_IN);
 		}
 		/* If the input pool is getting full, and the blocking
 		 * pool has room, send some entropy to the blocking
@@ -1940,6 +1939,17 @@ urandom_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
 		spin_unlock_irqrestore(&primary_crng.lock, flags);
 	}
 
+	return urandom_read_nowarn(file, buf, nbytes, ppos);
+}
+
+static ssize_t
+random_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
+{
+	int ret;
+
+	ret = wait_for_random_bytes();
+	if (ret != 0)
+		return ret;
 	return urandom_read_nowarn(file, buf, nbytes, ppos);
 }
 
