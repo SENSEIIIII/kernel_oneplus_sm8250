@@ -921,6 +921,7 @@ static int crng_fast_load(const char *cp, size_t len)
 		invalidate_batched_entropy();
 		crng_init = 1;
 		pr_notice("fast init done\n");
+		pr_notice("random: fast init done\n");
 	}
 	return 1;
 }
