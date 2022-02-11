@@ -194,11 +194,10 @@
 #include <linux/completion.h>
 #include <linux/uuid.h>
 #include <crypto/chacha.h>
+#include <linux/uaccess.h>
 #include <crypto/chacha20.h>
 #include <crypto/blake2s.h>
-
 #include <asm/processor.h>
-#include <linux/uaccess.h>
 #include <asm/irq.h>
 #include <asm/irq_regs.h>
 #include <asm/io.h>
@@ -756,7 +755,6 @@ static void crng_slow_load(const void *cp, size_t len)
 static void crng_reseed(void)
 {
 	unsigned long flags;
-<<<<<<< HEAD
 	int i, entropy_count;
 	union {
 		__u8	block[CHACHA_BLOCK_SIZE];
@@ -797,8 +795,6 @@ static void crng_reseed(void)
 		invalidate_batched_entropy();
 		numa_crng_init();
 	int entropy_count;
-=======
->>>>>>> 91737d22baec (random: introduce drain_entropy() helper to declutter crng_reseed())
 	unsigned long next_gen;
 	u8 key[CHACHA20_KEY_SIZE];
 	bool finalize_init = false;
