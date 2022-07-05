@@ -29,15 +29,20 @@ TRACE_EVENT(add_device_randomness,
 
 DECLARE_EVENT_CLASS(random__mix_pool_bytes,
 	TP_PROTO(size_t bytes, unsigned long IP),
+	TP_PROTO(const char *pool_name, int bytes, unsigned long IP),
 
-	TP_ARGS(bytes, IP),
+	TP_ARGS(pool_name, bytes, IP),
 
 	TP_STRUCT__entry(
 		__field(size_t,		bytes	)
 		__field(unsigned long,	IP	)
+		__field( const char *,	pool_name		)
+		__field(	  int,	bytes			)
+		__field(unsigned long,	IP			)
 	),
 
 	TP_fast_assign(
+		__entry->pool_name	= pool_name;
 		__entry->bytes		= bytes;
 		__entry->IP		= IP;
 	),
@@ -48,28 +53,40 @@ DECLARE_EVENT_CLASS(random__mix_pool_bytes,
 
 DEFINE_EVENT(random__mix_pool_bytes, mix_pool_bytes,
 	TP_PROTO(size_t bytes, unsigned long IP),
+	TP_printk("%s pool: bytes %d caller %pS",
+		  __entry->pool_name, __entry->bytes, (void *)__entry->IP)
+);
 
-	TP_ARGS(bytes, IP)
+DEFINE_EVENT(random__mix_pool_bytes, mix_pool_bytes,
+	TP_PROTO(const char *pool_name, int bytes, unsigned long IP),
+
+	TP_ARGS(pool_name, bytes, IP)
 );
 
 DEFINE_EVENT(random__mix_pool_bytes, mix_pool_bytes_nolock,
-	TP_PROTO(int bytes, unsigned long IP),
+	TP_PROTO(const char *pool_name, int bytes, unsigned long IP),
 
-	TP_ARGS(bytes, IP)
+	TP_ARGS(pool_name, bytes, IP)
 );
 
 TRACE_EVENT(credit_entropy_bits,
 	TP_PROTO(size_t bits, size_t entropy_count, unsigned long IP),
+	TP_PROTO(const char *pool_name, int bits, int entropy_count,
+		 unsigned long IP),
 
-	TP_ARGS(bits, entropy_count, IP),
+	TP_ARGS(pool_name, bits, entropy_count, IP),
 
 	TP_STRUCT__entry(
 		__field(size_t,		bits			)
 		__field(size_t,		entropy_count		)
+		__field( const char *,	pool_name		)
+		__field(	  int,	bits			)
+		__field(	  int,	entropy_count		)
 		__field(unsigned long,	IP			)
 	),
 
 	TP_fast_assign(
+		__entry->pool_name	= pool_name;
 		__entry->bits		= bits;
 		__entry->entropy_count	= entropy_count;
 		__entry->IP		= IP;
@@ -77,6 +94,30 @@ TRACE_EVENT(credit_entropy_bits,
 
 	TP_printk("input pool: bits %zu entropy_count %zu caller %pS",
 		  __entry->bits, __entry->entropy_count, (void *)__entry->IP)
+);
+
+	TP_printk("%s pool: bits %d entropy_count %d caller %pS",
+		  __entry->pool_name, __entry->bits,
+		  __entry->entropy_count, (void *)__entry->IP)
+);
+
+TRACE_EVENT(debit_entropy,
+	TP_PROTO(const char *pool_name, int debit_bits),
+
+	TP_ARGS(pool_name, debit_bits),
+
+	TP_STRUCT__entry(
+		__field( const char *,	pool_name		)
+		__field(	  int,	debit_bits		)
+	),
+
+	TP_fast_assign(
+		__entry->pool_name	= pool_name;
+		__entry->debit_bits	= debit_bits;
+	),
+
+	TP_printk("%s: debit_bits %d", __entry->pool_name,
+		  __entry->debit_bits)
 );
 
 TRACE_EVENT(add_input_randomness,
@@ -152,15 +193,29 @@ DECLARE_EVENT_CLASS(random__extract_entropy,
 	TP_STRUCT__entry(
 		__field(  size_t,	nbytes			)
 		__field(  size_t,	entropy_count		)
+	TP_PROTO(const char *pool_name, int nbytes, int entropy_count,
+		 unsigned long IP),
+
+	TP_ARGS(pool_name, nbytes, entropy_count, IP),
+
+	TP_STRUCT__entry(
+		__field( const char *,	pool_name		)
+		__field(	  int,	nbytes			)
+		__field(	  int,	entropy_count		)
+		__field(unsigned long,	IP			)
 	),
 
 	TP_fast_assign(
+		__entry->pool_name	= pool_name;
 		__entry->nbytes		= nbytes;
 		__entry->entropy_count	= entropy_count;
 	),
 
 	TP_printk("input pool: nbytes %zu entropy_count %zu",
 		  __entry->nbytes, __entry->entropy_count)
+	TP_printk("%s pool: nbytes %d entropy_count %d caller %pS",
+		  __entry->pool_name, __entry->nbytes, __entry->entropy_count,
+		  (void *)__entry->IP)
 );
 
 
@@ -168,6 +223,10 @@ DEFINE_EVENT(random__extract_entropy, extract_entropy,
 	TP_PROTO(size_t nbytes, size_t entropy_count),
 
 	TP_ARGS(nbytes, entropy_count)
+	TP_PROTO(const char *pool_name, int nbytes, int entropy_count,
+		 unsigned long IP),
+
+	TP_ARGS(pool_name, nbytes, entropy_count, IP)
 );
 
 DEFINE_EVENT(random__extract_entropy, extract_entropy_user,

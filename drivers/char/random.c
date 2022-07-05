@@ -67,6 +67,25 @@
 /* #define ADD_INTERRUPT_BENCH */
 
 /*
+ * Configuration information
+ */
+#define INPUT_POOL_SHIFT	12
+#define INPUT_POOL_WORDS	(1 << (INPUT_POOL_SHIFT-5))
+#define OUTPUT_POOL_SHIFT	10
+#define OUTPUT_POOL_WORDS	(1 << (OUTPUT_POOL_SHIFT-5))
+#define EXTRACT_SIZE		(BLAKE2S_HASH_SIZE / 2)
+
+/*
+ * To allow fractional bits to be tracked, the entropy_count field is
+ * denominated in units of 1/8th bits.
+ *
+ * 2*(ENTROPY_SHIFT + poolbitshift) must <= 31, or the multiply in
+ * credit_entropy_bits() needs to be 64 bits wide.
+ */
+#define ENTROPY_SHIFT 3
+#define ENTROPY_BITS(r) ((r)->entropy_count >> ENTROPY_SHIFT)
+
+/*
  * If the entropy count falls under this number of bits, then we
  * should wake up processes which are selecting or polling on write
  * access to /dev/random.
@@ -203,6 +222,34 @@ bool rng_is_initialized(void)
 	return crng_ready();
 }
 EXPORT_SYMBOL(rng_is_initialized);
+ **********************************************************************/
+
+struct entropy_store;
+struct entropy_store {
+	/* read-only data: */
+	u32 *pool;
+	const char *name;
+
+	/* read-write data: */
+	spinlock_t lock;
+	u16 add_ptr;
+	u16 input_rotate;
+	int entropy_count;
+};
+
+static ssize_t extract_entropy(struct entropy_store *r, void *buf,
+			       size_t nbytes, int min);
+static ssize_t _extract_entropy(struct entropy_store *r, void *buf,
+				size_t nbytes);
+
+static void crng_reseed(struct crng_state *crng, struct entropy_store *r);
+static u32 input_pool_data[INPUT_POOL_WORDS] __latent_entropy;
+
+static struct entropy_store input_pool = {
+	.name = "input",
+	.lock = __SPIN_LOCK_UNLOCKED(input_pool.lock),
+	.pool = input_pool_data
+};
 
 /* Used by wait_for_random_bytes(), and considered an entropy collector, below. */
 static void try_to_generate_entropy(void);
@@ -221,6 +268,32 @@ int wait_for_random_bytes(void)
 {
 	while (!crng_ready()) {
 		int ret;
+static void _mix_pool_bytes(struct entropy_store *r, const void *in,
+			    int nbytes)
+{
+	unsigned long i;
+	int input_rotate;
+	const u8 *bytes = in;
+	u32 w;
+
+	input_rotate = r->input_rotate;
+	i = r->add_ptr;
+
+	/* mix one byte at a time to simplify size handling and churn faster */
+	while (nbytes--) {
+		w = rol32(*bytes++, input_rotate);
+		i = (i - 1) & POOL_WORDMASK;
+
+		/* XOR in the various taps */
+		w ^= r->pool[i];
+		w ^= r->pool[(i + POOL_TAP1) & POOL_WORDMASK];
+		w ^= r->pool[(i + POOL_TAP2) & POOL_WORDMASK];
+		w ^= r->pool[(i + POOL_TAP3) & POOL_WORDMASK];
+		w ^= r->pool[(i + POOL_TAP4) & POOL_WORDMASK];
+		w ^= r->pool[(i + POOL_TAP5) & POOL_WORDMASK];
+
+		/* Mix the result back in with a twist */
+		r->pool[i] = (w >> 3) ^ twist_table[w & 7];
 
 		try_to_generate_entropy();
 		ret = wait_event_interruptible_timeout(crng_init_wait, crng_ready(), HZ);
@@ -228,6 +301,16 @@ int wait_for_random_bytes(void)
 			return ret > 0 ? 0 : ret;
 	}
 	return 0;
+
+	r->input_rotate = input_rotate;
+	r->add_ptr = i;
+}
+
+static void __mix_pool_bytes(struct entropy_store *r, const void *in,
+			     int nbytes)
+{
+	trace_mix_pool_bytes_nolock(r->name, nbytes, _RET_IP_);
+	_mix_pool_bytes(r, in, nbytes);
 }
 EXPORT_SYMBOL(wait_for_random_bytes);
 
@@ -239,12 +322,19 @@ EXPORT_SYMBOL(wait_for_random_bytes);
  *	    -EALREADY if pool is already initialised (callback not called)
  */
 int __cold register_random_ready_notifier(struct notifier_block *nb)
+static void mix_pool_bytes(struct entropy_store *r, const void *in,
+			   int nbytes)
 {
 	unsigned long flags;
 	int ret = -EALREADY;
 
 	if (crng_ready())
 		return ret;
+	trace_mix_pool_bytes(r->name, nbytes, _RET_IP_);
+	spin_lock_irqsave(&r->lock, flags);
+	_mix_pool_bytes(r, in, nbytes);
+	spin_unlock_irqrestore(&r->lock, flags);
+}
 
 	spin_lock_irqsave(&random_ready_chain_lock, flags);
 	if (!crng_ready())
@@ -278,6 +368,15 @@ static void __cold process_random_ready_list(void)
 
 #define warn_unseeded_randomness() \
 	_warn_unseeded_randomness(__func__, (void *)_RET_IP_)
+/*
+ * Credit (or debit) the entropy store with n bits of entropy.
+ * Use credit_entropy_bits_safe() if the value comes from userspace
+ * or otherwise should be checked for extreme values.
+ */
+static void credit_entropy_bits(struct entropy_store *r, int nbits)
+{
+	int entropy_count, orig;
+	int nfrac = nbits << ENTROPY_SHIFT;
 
 static void _warn_unseeded_randomness(const char *func_name, void *caller)
 {
@@ -285,7 +384,7 @@ static void _warn_unseeded_randomness(const char *func_name, void *caller)
 		return;
 
 retry:
-	entropy_count = orig = READ_ONCE(input_pool.entropy_count);
+	entropy_count = orig = READ_ONCE(r->entropy_count);
 	if (nfrac < 0) {
 		/* Debit */
 		entropy_count += nfrac;
@@ -329,11 +428,10 @@ retry:
 		pr_warn("negative entropy/overflow: pool %s count %d\n",
 		pr_warn("random: negative entropy/overflow: pool %s count %d\n",
 			r->name, entropy_count);
-		pr_warn("negative entropy/overflow: count %d\n", entropy_count);
 		entropy_count = 0;
 	} else if (entropy_count > POOL_FRACBITS)
 		entropy_count = POOL_FRACBITS;
-	if (cmpxchg(&input_pool.entropy_count, orig, entropy_count) != orig)
+	if (cmpxchg(&r->entropy_count, orig, entropy_count) != orig)
 		goto retry;
 
 	if (has_initialized) {
@@ -380,6 +478,18 @@ retry:
 				func_name, caller, crng_init);
 	printk_deferred(KERN_NOTICE "random: %s called from %pS with crng_init=%d\n",
 			func_name, caller, crng_init);
+}
+
+static int credit_entropy_bits_safe(struct entropy_store *r, int nbits)
+{
+	if (nbits < 0)
+		return -EINVAL;
+
+	/* Cap the value to avoid overflows */
+	nbits = min(nbits,  POOL_BITS);
+
+	credit_entropy_bits(r, nbits);
+	return 0;
 }
 	if (IS_ENABLED(CONFIG_WARN_ALL_UNSEEDED_RANDOM) && !crng_ready()) \
 		pr_notice("%s called from %pS with crng_init=%d\n", \
@@ -536,6 +646,14 @@ static bool crng_has_old_seed(void)
 		else
 			interval = max_t(unsigned int, CRNG_RESEED_START_INTERVAL,
 					 (unsigned int)uptime / 2 * HZ);
+static void __init crng_initialize_primary(struct crng_state *crng)
+{
+	_extract_entropy(&input_pool, &crng->state[4], sizeof(u32) * 12);
+	if (crng_init_try_arch_early(crng) && trust_cpu && crng_init < 2) {
+		invalidate_batched_entropy();
+		numa_crng_init();
+		crng_init = 2;
+		pr_notice("crng init done (trusting CPU's manufacturer)\n");
 	}
 	return time_is_before_jiffies(READ_ONCE(base_crng.birth) + interval);
 }
@@ -726,6 +844,10 @@ static void _get_random_bytes(void *buf, size_t len)
 {
 	unsigned long flags;
 	int i, entropy_count;
+static void crng_reseed(struct crng_state *crng, struct entropy_store *r)
+{
+	unsigned long	flags;
+	int		i, num;
 	union {
 		__u8	block[CHACHA_BLOCK_SIZE];
 		__u32	key[8];
@@ -745,6 +867,10 @@ static void _get_random_bytes(void *buf, size_t len)
 		extract_entropy(buf.key, sizeof(buf.key));
 		wake_up_interruptible(&random_write_wait);
 		kill_fasync(&fasync, SIGIO, POLL_OUT);
+	if (r) {
+		num = extract_entropy(r, &buf, 32, 16);
+		if (num == 0)
+			return;
 	} else {
 		_extract_crng(&primary_crng, buf.block);
 		_crng_backtrack_protect(&primary_crng, buf.block,
@@ -1048,6 +1174,11 @@ static void mix_pool_bytes(const void *buf, size_t len)
 		init_time = READ_ONCE(primary_crng.init_time);
 		if (time_after(jiffies, init_time + CRNG_RESEED_INTERVAL))
 			crng_reseed();
+		init_time = READ_ONCE(crng->init_time);
+		if (time_after(READ_ONCE(crng_global_init_time), init_time) ||
+		    time_after(jiffies, init_time + CRNG_RESEED_INTERVAL))
+			crng_reseed(crng, crng == &primary_crng ?
+				    &input_pool : NULL);
 	}
 	spin_lock_irqsave(&crng->lock, flags);
 	chacha20_block(&crng->state[0], out);
@@ -1386,6 +1517,8 @@ void add_device_randomness(const void *buf, size_t len)
 	spin_lock_irqsave(&input_pool.lock, flags);
 	_mix_pool_bytes(&entropy, sizeof(entropy));
 	_mix_pool_bytes(buf, len);
+	_mix_pool_bytes(&input_pool, buf, size);
+	_mix_pool_bytes(&input_pool, &time, sizeof(time));
 	spin_unlock_irqrestore(&input_pool.lock, flags);
 }
 EXPORT_SYMBOL(add_device_randomness);
@@ -1417,6 +1550,19 @@ static void add_timer_randomness(struct timer_rand_state *state, unsigned int nu
 
 	if (crng_ready())
 		return;
+	struct entropy_store	*r;
+	struct {
+		long jiffies;
+		unsigned int cycles;
+		unsigned int num;
+	} sample;
+	long delta, delta2, delta3;
+
+	sample.jiffies = jiffies;
+	sample.cycles = random_get_entropy();
+	sample.num = num;
+	r = &input_pool;
+	mix_pool_bytes(r, &sample, sizeof(sample));
 
 	/*
 	 * Calculate number of bits of randomness we probably added.
@@ -1449,6 +1595,7 @@ static void add_timer_randomness(struct timer_rand_state *state, unsigned int nu
 	 * and limit entropy estimate to 12 bits.
 	 */
 	credit_init_bits(min_t(unsigned int, fls(delta >> 1), 11));
+	credit_entropy_bits(r, min_t(int, fls(delta>>1), 11));
 }
 
 void add_input_randomness(unsigned int type, unsigned int code,
@@ -1592,6 +1739,27 @@ static void mix_interrupt_randomness(struct work_struct *work)
 	 */
 	unsigned long pool[2];
 	unsigned int count;
+	struct entropy_store	*r;
+	struct fast_pool	*fast_pool = this_cpu_ptr(&irq_randomness);
+	struct pt_regs		*regs = get_irq_regs();
+	unsigned long		now = jiffies;
+	cycles_t		cycles = random_get_entropy();
+	u32			c_high, j_high;
+	u64			ip;
+
+	if (cycles == 0)
+		cycles = get_reg(fast_pool, regs);
+	c_high = (sizeof(cycles) > 4) ? cycles >> 32 : 0;
+	j_high = (sizeof(now) > 4) ? now >> 32 : 0;
+	fast_pool->pool[0] ^= cycles ^ j_high ^ irq;
+	fast_pool->pool[1] ^= now ^ c_high;
+	ip = regs ? instruction_pointer(regs) : _RET_IP_;
+	fast_pool->pool[2] ^= ip;
+	fast_pool->pool[3] ^= (sizeof(ip) > 4) ? ip >> 32 :
+		get_reg(fast_pool, regs);
+
+	fast_mix(fast_pool);
+	add_interrupt_bench(cycles);
 
 	/* Check to see if we're running on the wrong CPU due to hotplug. */
 	local_irq_disable();
@@ -1640,6 +1808,13 @@ void add_interrupt_randomness(int irq)
 	queue_work_on(raw_smp_processor_id(), system_highpri_wq, &fast_pool->mix);
 }
 EXPORT_SYMBOL_GPL(add_interrupt_randomness);
+	r = &input_pool;
+	if (!spin_trylock(&r->lock))
+		return;
+
+	fast_pool->last = now;
+	__mix_pool_bytes(r, &fast_pool->pool, sizeof(fast_pool->pool));
+	spin_unlock(&r->lock);
 
 /* There is one of these per entropy source */
 struct timer_rand_state {
@@ -1718,6 +1893,8 @@ static void add_timer_randomness(struct timer_rand_state *state, unsigned int nu
 		this_cpu_ptr(&irq_randomness)->count += max(1u, bits * 64) - 1;
 	else
 		_credit_init_bits(bits);
+	/* award one bit for the contents of the fast pool */
+	credit_entropy_bits(r, 1);
 }
 
 void add_input_randomness(unsigned int type, unsigned int code, unsigned int value)
@@ -1742,6 +1919,7 @@ void add_disk_randomness(struct gendisk *disk)
 		return;
 	/* first major is 1, so we get >= 0x200 here */
 	add_timer_randomness(disk->random, 0x100 + disk_devt(disk));
+	trace_add_disk_randomness(disk_devt(disk), ENTROPY_BITS(&input_pool));
 }
 EXPORT_SYMBOL_GPL(add_disk_randomness);
 #endif
@@ -1784,20 +1962,31 @@ void __cold rand_initialize_disk(struct gendisk *disk)
  */
 static size_t account(size_t nbytes, int min)
 static void __cold entropy_timer(struct timer_list *t)
+static size_t account(struct entropy_store *r, size_t nbytes, int min)
 {
 	int entropy_count, orig;
 	size_t ibytes, nfrac;
 
-	BUG_ON(input_pool.entropy_count > POOL_FRACBITS);
+	BUG_ON(r->entropy_count > POOL_FRACBITS);
 
 	/* Can we pull enough? */
 retry:
 	entropy_count = orig = READ_ONCE(input_pool.entropy_count);
+	entropy_count = orig = READ_ONCE(r->entropy_count);
+	ibytes = nbytes;
+	/* never pull more than available */
+	have_bytes = entropy_count >> (ENTROPY_SHIFT + 3);
+
+	if (have_bytes < 0)
+		have_bytes = 0;
+	ibytes = min_t(size_t, ibytes, have_bytes);
+	if (ibytes < min)
+		ibytes = 0;
+
 	if (WARN_ON(entropy_count < 0)) {
 		pr_warn("negative entropy count: pool %s count %d\n",
 		pr_warn("random: negative entropy count: pool %s count %d\n",
 			r->name, entropy_count);
-		pr_warn("negative entropy count: count %d\n", entropy_count);
 		entropy_count = 0;
 	}
 
@@ -1811,11 +2000,13 @@ retry:
 	else
 		entropy_count = 0;
 
-	if (cmpxchg(&input_pool.entropy_count, orig, entropy_count) != orig)
+	if (cmpxchg(&r->entropy_count, orig, entropy_count) != orig)
 		goto retry;
 
 	trace_debit_entropy(8 * ibytes);
 	if (ibytes && POOL_ENTROPY_BITS() < random_write_wakeup_bits) {
+	trace_debit_entropy(r->name, 8 * ibytes);
+	if (ibytes && ENTROPY_BITS(r) < random_write_wakeup_bits) {
 		wake_up_interruptible(&random_write_wait);
 		kill_fasync(&fasync, SIGIO, POLL_OUT);
 	}
@@ -1830,6 +2021,7 @@ retry:
  */
 static void extract_entropy(void *buf, size_t nbytes)
 static void __cold try_to_generate_entropy(void)
+static void extract_buf(struct entropy_store *r, u8 *out)
 {
 	unsigned long flags;
 	u8 seed[BLAKE2S_HASH_SIZE], next_key[BLAKE2S_HASH_SIZE];
@@ -1916,6 +2108,10 @@ SYSCALL_DEFINE3(getrandom, char __user *, ubuf, size_t, len, unsigned int, flags
 
 	if (flags & ~(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE))
 		return -EINVAL;
+	/* Generate a hash across the pool */
+	spin_lock_irqsave(&r->lock, flags);
+	blake2s_update(&state, (const u8 *)r->pool, POOL_BYTES);
+	blake2s_final(&state, hash); /* final zeros out state */
 
 	/*
 	 * Requesting insecure and blocking randomness at the same time makes
@@ -1923,7 +2119,8 @@ SYSCALL_DEFINE3(getrandom, char __user *, ubuf, size_t, len, unsigned int, flags
 	 */
 	if ((flags & (GRND_INSECURE | GRND_RANDOM)) == (GRND_INSECURE | GRND_RANDOM))
 		return -EINVAL;
-
+	__mix_pool_bytes(r, hash, sizeof(hash));
+	spin_unlock_irqrestore(&r->lock, flags);
 	if (!crng_ready() && !(flags & GRND_INSECURE)) {
 		if (flags & GRND_NONBLOCK)
 			return -EAGAIN;
@@ -1946,6 +2143,16 @@ SYSCALL_DEFINE3(getrandom, char __user *, ubuf, size_t, len, unsigned int, flags
 		/* output = HASHPRF(seed, RDSEED || ++counter) */
 		++block.counter;
 		blake2s(buf, (u8 *)&block, seed, i, sizeof(block), sizeof(seed));
+static ssize_t _extract_entropy(struct entropy_store *r, void *buf,
+				size_t nbytes)
+{
+	ssize_t ret = 0, i;
+	u8 tmp[EXTRACT_SIZE];
+
+	while (nbytes) {
+		extract_buf(r, tmp);
+		i = min_t(int, nbytes, EXTRACT_SIZE);
+		memcpy(buf, tmp, i);
 		nbytes -= i;
 		buf += i;
 	}
@@ -1975,6 +2182,12 @@ static bool drain_entropy(void *buf, size_t nbytes)
 	wake_up_interruptible(&random_write_wait);
 	kill_fasync(&fasync, SIGIO, POLL_OUT);
 	return true;
+static ssize_t extract_entropy(struct entropy_store *r, void *buf,
+				 size_t nbytes, int min)
+{
+	trace_extract_entropy(r->name, nbytes, ENTROPY_BITS(r), _RET_IP_);
+	nbytes = account(r, nbytes, min);
+	return _extract_entropy(r, buf, nbytes);
 }
 
 #define warn_unseeded_randomness(previous) \
@@ -2083,7 +2296,7 @@ void get_random_bytes(void *buf, size_t nbytes)
  */
 static void entropy_timer(struct timer_list *t)
 {
-	credit_entropy_bits(1);
+	credit_entropy_bits(&input_pool, 1);
 }
 
 /*
@@ -2108,19 +2321,179 @@ static void try_to_generate_entropy(void)
 		if (!timer_pending(&stack.timer))
 			mod_timer(&stack.timer, jiffies + 1);
 		mix_pool_bytes(&stack.now, sizeof(stack.now));
+			mod_timer(&stack.timer, jiffies+1);
+		mix_pool_bytes(&input_pool, &stack.now, sizeof(stack.now));
 		schedule();
 		stack.now = random_get_entropy();
 	}
 
 	del_timer_sync(&stack.timer);
 	destroy_timer_on_stack(&stack.timer);
-	mix_pool_bytes(&stack.now, sizeof(stack.now));
+	mix_pool_bytes(&input_pool, &stack.now, sizeof(stack.now));
 }
 
 static bool trust_cpu __ro_after_init = IS_ENABLED(CONFIG_RANDOM_TRUST_CPU);
 static int __init parse_trust_cpu(char *arg)
 {
 	return kstrtobool(arg, &trust_cpu);
+/*
+ * Wait for the urandom pool to be seeded and thus guaranteed to supply
+ * cryptographically secure random numbers. This applies to: the /dev/urandom
+ * device, the get_random_bytes function, and the get_random_{u32,u64,int,long}
+ * family of functions. Using any of these functions without first calling
+ * this function forfeits the guarantee of security.
+ *
+ * Returns: 0 if the urandom pool has been seeded.
+ *          -ERESTARTSYS if the function was interrupted by a signal.
+ */
+int wait_for_random_bytes(void)
+{
+	if (likely(crng_ready()))
+		return 0;
+
+	do {
+		int ret;
+		ret = wait_event_interruptible_timeout(crng_init_wait, crng_ready(), HZ);
+		if (ret)
+			return ret > 0 ? 0 : ret;
+
+		try_to_generate_entropy();
+	} while (!crng_ready());
+
+	return 0;
+}
+EXPORT_SYMBOL(wait_for_random_bytes);
+
+/*
+ * Returns whether or not the urandom pool has been seeded and thus guaranteed
+ * to supply cryptographically secure random numbers. This applies to: the
+ * /dev/urandom device, the get_random_bytes function, and the get_random_{u32,
+ * ,u64,int,long} family of functions.
+ *
+ * Returns: true if the urandom pool has been seeded.
+ *          false if the urandom pool has not been seeded.
+ */
+bool rng_is_initialized(void)
+{
+	return crng_ready();
+}
+EXPORT_SYMBOL(rng_is_initialized);
+
+/*
+ * Add a callback function that will be invoked when the nonblocking
+ * pool is initialised.
+ *
+ * returns: 0 if callback is successfully added
+ *	    -EALREADY if pool is already initialised (callback not called)
+ *	    -ENOENT if module for callback is not alive
+ */
+int add_random_ready_callback(struct random_ready_callback *rdy)
+{
+	struct module *owner;
+	unsigned long flags;
+	int err = -EALREADY;
+
+	if (crng_ready())
+		return err;
+
+	owner = rdy->owner;
+	if (!try_module_get(owner))
+		return -ENOENT;
+
+	spin_lock_irqsave(&random_ready_list_lock, flags);
+	if (crng_ready())
+		goto out;
+
+	owner = NULL;
+
+	list_add(&rdy->list, &random_ready_list);
+	err = 0;
+
+out:
+	spin_unlock_irqrestore(&random_ready_list_lock, flags);
+
+	module_put(owner);
+
+	return err;
+}
+EXPORT_SYMBOL(add_random_ready_callback);
+
+/*
+ * Delete a previously registered readiness callback function.
+ */
+void del_random_ready_callback(struct random_ready_callback *rdy)
+{
+	unsigned long flags;
+	struct module *owner = NULL;
+
+	spin_lock_irqsave(&random_ready_list_lock, flags);
+	if (!list_empty(&rdy->list)) {
+		list_del_init(&rdy->list);
+		owner = rdy->owner;
+	}
+	spin_unlock_irqrestore(&random_ready_list_lock, flags);
+
+	module_put(owner);
+}
+EXPORT_SYMBOL(del_random_ready_callback);
+
+/*
+ * This function will use the architecture-specific hardware random
+ * number generator if it is available.  The arch-specific hw RNG will
+ * almost certainly be faster than what we can do in software, but it
+ * is impossible to verify that it is implemented securely (as
+ * opposed, to, say, the AES encryption of a sequence number using a
+ * key known by the NSA).  So it's useful if we need the speed, but
+ * only if we're willing to trust the hardware manufacturer not to
+ * have put in a back door.
+ *
+ * Return number of bytes filled in.
+ */
+int __must_check get_random_bytes_arch(void *buf, int nbytes)
+{
+	int left = nbytes;
+	u8 *p = buf;
+
+	trace_get_random_bytes_arch(left, _RET_IP_);
+	while (left) {
+		unsigned long v;
+		int chunk = min_t(int, left, sizeof(unsigned long));
+
+		if (!arch_get_random_long(&v))
+			break;
+
+		memcpy(p, &v, chunk);
+		p += chunk;
+		left -= chunk;
+	}
+
+	return nbytes - left;
+}
+EXPORT_SYMBOL(get_random_bytes_arch);
+
+/*
+ * init_std_data - initialize pool with system data
+ *
+ * @r: pool to initialize
+ *
+ * This function clears the pool's entropy count and mixes some system
+ * data into the pool to prepare it for use. The pool is not cleared
+ * as that can only decrease the entropy in the pool.
+ */
+static void __init init_std_data(struct entropy_store *r)
+{
+	int i;
+	ktime_t now = ktime_get_real();
+	unsigned long rv;
+
+	mix_pool_bytes(r, &now, sizeof(now));
+	for (i = POOL_BYTES; i > 0; i -= sizeof(rv)) {
+		if (!arch_get_random_seed_long(&rv) &&
+		    !arch_get_random_long(&rv))
+			rv = random_get_entropy();
+		mix_pool_bytes(r, &rv, sizeof(rv));
+	}
+	mix_pool_bytes(r, utsname(), sizeof(*(utsname())));
 }
 early_param("random.trust_cpu", parse_trust_cpu);
 
@@ -2160,6 +2533,11 @@ int __init rand_initialize(void)
 		pr_notice("crng init done (trusting CPU's manufacturer)\n");
 	}
 
+	init_std_data(&input_pool);
+	if (crng_need_final_init)
+		crng_finalize_init(&primary_crng);
+	crng_initialize_primary(&primary_crng);
+	crng_global_init_time = jiffies;
 	if (ratelimit_disable) {
 		urandom_warning.interval = 0;
 		unseeded_warning.interval = 0;
@@ -2231,6 +2609,9 @@ urandom_read_nowarn(struct file *file, char __user *buf, size_t nbytes,
 
 	ret = get_random_bytes_user(buf, nbytes);
 	trace_urandom_read(nbytes, input_pool.entropy_count);
+	nbytes = min_t(size_t, nbytes, INT_MAX >> (ENTROPY_SHIFT + 3));
+	ret = extract_crng_user(buf, nbytes);
+	trace_urandom_read(8 * nbytes, 0, ENTROPY_BITS(&input_pool));
 	return ret;
 }
 
@@ -2270,6 +2651,7 @@ static __poll_t random_poll(struct file *file, poll_table *wait)
 	if (crng_ready())
 		mask |= EPOLLIN | EPOLLRDNORM;
 	if (input_pool.entropy_count < POOL_MIN_BITS)
+	if (ENTROPY_BITS(&input_pool) < random_write_wakeup_bits)
 		mask |= EPOLLOUT | EPOLLWRNORM;
 	return mask;
 }
@@ -2278,6 +2660,8 @@ static int write_pool(const char __user *ubuf, size_t count)
 static int write_pool(const char __user *ubuf, size_t len)
 static ssize_t write_pool(struct iov_iter *iter)
 static ssize_t write_pool_user(struct iov_iter *iter)
+static int
+write_pool(struct entropy_store *r, const char __user *buffer, size_t count)
 {
 	u8 block[BLAKE2S_BLOCK_SIZE];
 	ssize_t ret = 0;
@@ -2322,6 +2706,8 @@ static ssize_t urandom_read_iter(struct kiocb *kiocb, struct iov_iter *iter)
 			pr_notice("%s: uninitialized urandom read (%zu bytes read)\n",
 				  current->comm, iov_iter_count(iter));
 		}
+		mix_pool_bytes(r, buf, bytes);
+		cond_resched();
 	}
 
 	return get_random_bytes_user(iter);
@@ -2333,6 +2719,8 @@ static ssize_t random_read_iter(struct kiocb *kiocb, struct iov_iter *iter)
 
 	ret = wait_for_random_bytes();
 	if (ret != 0)
+	ret = write_pool(&input_pool, buffer, count);
+	if (ret)
 		return ret;
 	return get_random_bytes_user(iter);
 }
@@ -2346,6 +2734,9 @@ static long random_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	case RNDGETENTCNT:
 		/* Inherently racy, no point locking. */
 		if (put_user(input_pool.init_bits, p))
+		/* inherently racy, no point locking */
+		ent_count = ENTROPY_BITS(&input_pool);
+		if (put_user(ent_count, p))
 			return -EFAULT;
 		return 0;
 	case RNDADDTOENTCNT:
@@ -2363,6 +2754,8 @@ static long random_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		ssize_t ret;
 		int len;
 
+		return credit_entropy_bits_safe(&input_pool, ent_count);
+	case RNDADDENTROPY:
 		if (!capable(CAP_SYS_ADMIN))
 			return -EPERM;
 		if (get_user(ent_count, p++))
@@ -2383,6 +2776,11 @@ static long random_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		credit_init_bits(ent_count);
 		return 0;
 	}
+		retval = write_pool(&input_pool, (const char __user *)p,
+				    size);
+		if (retval < 0)
+			return retval;
+		return credit_entropy_bits_safe(&input_pool, ent_count);
 	case RNDZAPENTCNT:
 	case RNDCLEARPOOL:
 		/* No longer has any effect. */
@@ -2395,6 +2793,8 @@ static long random_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		if (!crng_ready())
 			return -ENODATA;
 		crng_reseed();
+		crng_reseed(&primary_crng, &input_pool);
+		WRITE_ONCE(crng_global_init_time, jiffies - 1);
 		return 0;
 	default:
 		return -EINVAL;
@@ -2685,9 +3085,11 @@ unsigned long randomize_page(unsigned long start, unsigned long range)
 void add_hwgenerator_randomness(const void *buffer, size_t count,
 				size_t entropy)
 {
+	struct entropy_store *poolp = &input_pool;
+
 	if (unlikely(crng_init == 0)) {
 		size_t ret = crng_fast_load(buffer, count);
-		mix_pool_bytes(buffer, ret);
+		mix_pool_bytes(poolp, buffer, ret);
 		count -= ret;
 		buffer += ret;
 		if (!count || crng_init == 0)
@@ -2705,6 +3107,9 @@ void add_hwgenerator_randomness(const void *buffer, size_t count,
 			CRNG_RESEED_INTERVAL);
 	mix_pool_bytes(buffer, count);
 	credit_entropy_bits(entropy);
+			ENTROPY_BITS(&input_pool) <= random_write_wakeup_bits);
+	mix_pool_bytes(poolp, buffer, count);
+	credit_entropy_bits(poolp, entropy);
 }
 EXPORT_SYMBOL_GPL(add_hwgenerator_randomness);
 
