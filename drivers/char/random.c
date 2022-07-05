@@ -445,6 +445,9 @@ struct entropy_store {
 		    BLAKE2S_IV5, BLAKE2S_IV6, BLAKE2S_IV7 },
 	.hash.outlen = BLAKE2S_HASH_SIZE,
 	.lock = __SPIN_LOCK_UNLOCKED(input_pool.lock),
+	unsigned int initialized:1;
+	unsigned int last_data_init:1;
+	__u8 last_data[EXTRACT_SIZE];
 };
 
 static ssize_t extract_entropy(struct entropy_store *r, void *buf,
@@ -600,6 +603,8 @@ static void __cold process_random_ready_list(void)
 static void credit_entropy_bits(struct entropy_store *r, int nbits)
 {
 	int entropy_count, orig;
+	int entropy_count, orig, has_initialized = 0;
+	const int pool_size = r->poolinfo->poolfracbits;
 	int nfrac = nbits << ENTROPY_SHIFT;
 	int entropy_count, entropy_bits, orig;
 	int nfrac = nbits << POOL_ENTROPY_SHIFT;
@@ -681,7 +686,9 @@ retry:
 	if (r == &input_pool) {
 		int entropy_bits = entropy_count >> ENTROPY_SHIFT;
 
-		if (crng_init < 2 && entropy_bits >= 128)
+		if (crng_init < 2) {
+			if (entropy_bits < 128)
+				return;
 			crng_reseed(&primary_crng, r);
 			entropy_bits = ENTROPY_BITS(r);
 		}
@@ -2347,6 +2354,10 @@ retry:
 /*
  * This is an HKDF-like construction for using the hashed collected entropy
  * as a PRF key, that's then expanded block-by-block.
+ * This function does the actual extraction for extract_entropy and
+ * extract_entropy_user.
+ *
+ * Note: we assume that .poolwords is a multiple of 16 words.
  */
 static void extract_entropy(void *buf, size_t nbytes)
 static void __cold try_to_generate_entropy(void)
