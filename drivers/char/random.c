@@ -149,6 +149,13 @@ enum poolinfo {
 enum {
 	POOL_BITS = BLAKE2S_HASH_SIZE * 8,
 	POOL_MIN_BITS = POOL_BITS /* No point in settling for less. */
+	POOL_BITSHIFT = ilog2(POOL_BITS),
+
+	/* To allow fractional bits to be tracked, the entropy_count field is
+	 * denominated in units of 1/8th bits. */
+	POOL_ENTROPY_SHIFT = 3,
+#define POOL_ENTROPY_BITS() (input_pool.entropy_count >> POOL_ENTROPY_SHIFT)
+	POOL_FRACBITS = POOL_BITS << POOL_ENTROPY_SHIFT
 };
 
 /*
@@ -241,6 +248,8 @@ static ssize_t extract_entropy(struct entropy_store *r, void *buf,
 			       size_t nbytes, int min);
 static ssize_t _extract_entropy(struct entropy_store *r, void *buf,
 				size_t nbytes);
+static bool extract_entropy(void *buf, size_t nbytes, int min);
+static void _extract_entropy(void *buf, size_t nbytes);
 
 static void crng_reseed(struct crng_state *crng, struct entropy_store *r);
 static u32 input_pool_data[INPUT_POOL_WORDS] __latent_entropy;
@@ -377,6 +386,8 @@ static void credit_entropy_bits(struct entropy_store *r, int nbits)
 {
 	int entropy_count, orig;
 	int nfrac = nbits << ENTROPY_SHIFT;
+	int entropy_count, entropy_bits, orig;
+	int nfrac = nbits << POOL_ENTROPY_SHIFT;
 
 static void _warn_unseeded_randomness(const char *func_name, void *caller)
 {
@@ -478,6 +489,9 @@ retry:
 				func_name, caller, crng_init);
 	printk_deferred(KERN_NOTICE "random: %s called from %pS with crng_init=%d\n",
 			func_name, caller, crng_init);
+	entropy_bits = entropy_count >> POOL_ENTROPY_SHIFT;
+	if (crng_init < 2 && entropy_bits >= 128)
+		crng_reseed(&primary_crng, true);
 }
 
 static int credit_entropy_bits_safe(struct entropy_store *r, int nbits)
@@ -650,6 +664,10 @@ static void __init crng_initialize_primary(struct crng_state *crng)
 {
 	_extract_entropy(&input_pool, &crng->state[4], sizeof(u32) * 12);
 	if (crng_init_try_arch_early(crng) && trust_cpu && crng_init < 2) {
+static void __init crng_initialize_primary(void)
+{
+	_extract_entropy(&primary_crng.state[4], sizeof(u32) * 12);
+	if (crng_init_try_arch_early() && trust_cpu && crng_init < 2) {
 		invalidate_batched_entropy();
 		numa_crng_init();
 		crng_init = 2;
@@ -870,6 +888,8 @@ static void crng_reseed(struct crng_state *crng, struct entropy_store *r)
 	if (r) {
 		num = extract_entropy(r, &buf, 32, 16);
 		if (num == 0)
+	if (use_input_pool) {
+		if (!extract_entropy(&buf, 32, 16))
 			return;
 	} else {
 		_extract_crng(&primary_crng, buf.block);
@@ -2022,6 +2042,7 @@ retry:
 static void extract_entropy(void *buf, size_t nbytes)
 static void __cold try_to_generate_entropy(void)
 static void extract_buf(struct entropy_store *r, u8 *out)
+static void _extract_entropy(void *buf, size_t nbytes)
 {
 	unsigned long flags;
 	u8 seed[BLAKE2S_HASH_SIZE], next_key[BLAKE2S_HASH_SIZE];
@@ -2035,6 +2056,9 @@ static void extract_buf(struct entropy_store *r, u8 *out)
 		if (!arch_get_random_seed_long(&block.rdseed[i]) &&
 		    !arch_get_random_long(&block.rdseed[i]))
 			block.rdseed[i] = random_get_entropy();
+	for (i = 0; i < ARRAY_SIZE(block.rdrand); ++i) {
+		if (!arch_get_random_long(&block.rdrand[i]))
+			block.rdrand[i] = random_get_entropy();
 	}
 
 	spin_lock_irqsave(&input_pool.lock, flags);
@@ -2188,6 +2212,25 @@ static ssize_t extract_entropy(struct entropy_store *r, void *buf,
 	trace_extract_entropy(r->name, nbytes, ENTROPY_BITS(r), _RET_IP_);
 	nbytes = account(r, nbytes, min);
 	return _extract_entropy(r, buf, nbytes);
+}
+
+/*
+ * This function extracts randomness from the "entropy pool", and
+ * returns it in a buffer.
+ *
+ * The min parameter specifies the minimum amount we can pull before
+ * failing to avoid races that defeat catastrophic reseeding. If we
+ * have less than min entropy available, we return false and buf is
+ * not filled.
+ */
+static bool extract_entropy(void *buf, size_t nbytes, int min)
+{
+	trace_extract_entropy(nbytes, POOL_ENTROPY_BITS(), _RET_IP_);
+	if (account(nbytes, min)) {
+		_extract_entropy(buf, nbytes);
+		return true;
+	}
+	return false;
 }
 
 #define warn_unseeded_randomness(previous) \
