@@ -1401,6 +1401,37 @@ int __cold random_prepare_cpu(unsigned int cpu)
 	return 0;
 }
 #endif
+/**
+ * randomize_page - Generate a random, page aligned address
+ * @start:	The smallest acceptable address the caller will take.
+ * @range:	The size of the area, starting at @start, within which the
+ *		random address must fall.
+ *
+ * If @start + @range would overflow, @range is capped.
+ *
+ * NOTE: Historical use of randomize_range, which this replaces, presumed that
+ * @start was already page aligned.  We now align it regardless.
+ *
+ * Return: A page aligned address within [start, start + range).  On error,
+ * @start is returned.
+ */
+unsigned long randomize_page(unsigned long start, unsigned long range)
+{
+	if (!PAGE_ALIGNED(start)) {
+		range -= PAGE_ALIGN(start) - start;
+		start = PAGE_ALIGN(start);
+	}
+
+	if (start > ULONG_MAX - range)
+		range = ULONG_MAX - start;
+
+	range >>= PAGE_SHIFT;
+
+	if (range == 0)
+		return start;
+
+	return start + (get_random_long() % range << PAGE_SHIFT);
+}
 
 /*
  * This function will use the architecture-specific hardware random
@@ -2002,6 +2033,8 @@ static DEFINE_PER_CPU(struct fast_pool, irq_randomness) = {
 #define FASTMIX_PERM HSIPHASH_PERMUTATION
 	.pool = { HSIPHASH_CONST_0, HSIPHASH_CONST_1, HSIPHASH_CONST_2, HSIPHASH_CONST_3 }
 #endif
+	atomic_t count;
+	u16 reg_idx;
 };
 
 /*
@@ -2042,6 +2075,22 @@ int __cold random_online_cpu(unsigned int cpu)
 	return 0;
 }
 #endif
+static DEFINE_PER_CPU(struct fast_pool, irq_randomness);
+
+static u32 get_reg(struct fast_pool *f, struct pt_regs *regs)
+{
+	u32 *ptr = (u32 *)regs;
+	unsigned int idx;
+
+	if (regs == NULL)
+		return 0;
+	idx = READ_ONCE(f->reg_idx);
+	if (idx >= sizeof(struct pt_regs) / sizeof(u32))
+		idx = 0;
+	ptr += idx++;
+	WRITE_ONCE(f->reg_idx, idx);
+	return *ptr;
+}
 
 static void mix_interrupt_randomness(struct work_struct *work)
 {
@@ -2081,6 +2130,15 @@ static void mix_interrupt_randomness(struct work_struct *work)
 	local_irq_disable();
 	if (fast_pool != this_cpu_ptr(&irq_randomness)) {
 		local_irq_enable();
+		/*
+		 * If we are unlucky enough to have been moved to another CPU,
+		 * during CPU hotplug while the CPU was shutdown then we set
+		 * our count to zero atomically so that when the CPU comes
+		 * back online, it can enqueue work again. The _release here
+		 * pairs with the atomic_inc_return_acquire in
+		 * add_interrupt_randomness().
+		 */
+		atomic_set_release(&fast_pool->count, 0);
 		return;
 	}
 
@@ -2091,6 +2149,8 @@ static void mix_interrupt_randomness(struct work_struct *work)
 	memcpy(pool, fast_pool->pool, sizeof(pool));
 	count = fast_pool->count;
 	fast_pool->count = 0;
+	memcpy(pool, fast_pool->pool32, sizeof(pool));
+	atomic_set(&fast_pool->count, 0);
 	fast_pool->last = jiffies;
 	local_irq_enable();
 
@@ -2197,6 +2257,9 @@ static void add_timer_randomness(struct timer_rand_state *state, unsigned int nu
 	 * on general principles, and limit entropy estimate to 11 bits.
 	 */
 	bits = min(fls(delta >> 1), 11);
+	fast_mix(fast_pool->pool32);
+	/* The _acquire here pairs with the atomic_set_release in mix_interrupt_randomness(). */
+	new_count = (unsigned int)atomic_inc_return_acquire(&fast_pool->count);
 
 	/*
 	 * As mentioned above, if we're in a hard IRQ, add_interrupt_randomness()
@@ -2216,6 +2279,10 @@ static void add_timer_randomness(struct timer_rand_state *state, unsigned int nu
 		if ((fast_pool->count >= 64) &&
 		    crng_fast_load((u8 *)fast_pool->pool, sizeof(fast_pool->pool)) > 0) {
 			fast_pool->count = 0;
+		if (new_count >= 64 &&
+		    crng_pre_init_inject(fast_pool->pool32, sizeof(fast_pool->pool32),
+					 true, true) > 0) {
+			atomic_set(&fast_pool->count, 0);
 			fast_pool->last = now;
 			if (spin_trylock(&input_pool.lock)) {
 				_mix_pool_bytes(&fast_pool->pool, sizeof(fast_pool->pool));
@@ -2245,6 +2312,10 @@ void add_input_randomness(unsigned int type, unsigned int code, unsigned int val
 
 	/* award one bit for the contents of the fast pool */
 	credit_entropy_bits(1);
+	if (unlikely(!fast_pool->mix.func))
+		INIT_WORK(&fast_pool->mix, mix_interrupt_randomness);
+	atomic_or(MIX_INFLIGHT, &fast_pool->count);
+	queue_work_on(raw_smp_processor_id(), system_highpri_wq, &fast_pool->mix);
 }
 EXPORT_SYMBOL_GPL(add_input_randomness);
 
