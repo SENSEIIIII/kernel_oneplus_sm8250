@@ -59,7 +59,7 @@ static u32 	uboot_log_buf_len;
 /*
  * init uboot/kboot log buffer addr/size
  */
-static int uboot_kboot_buffer_init()
+static int uboot_kboot_buffer_init(void)
 {
 	struct reserved_mem *r_mem = NULL;
 	struct device_node *reserved_memory, *kboot_uboot_logmemory;
@@ -167,7 +167,7 @@ const struct file_operations kboot_fops = {
 /*
  * Dont printk any log int this thread
  */
-static int ubootback_thread_fn()
+static int ubootback_thread_fn(void)
 {
 	size_t line_len = 0;
 	u32 idx =0;
@@ -187,24 +187,6 @@ static int ubootback_thread_fn()
 		idx = kboot_dumper.cur_idx;
 		msleep(10*1000);
 
-	}
-	return 0;
-}
-
-static int __init kernel_uboot_log_init()
-{
-	struct proc_dir_entry *pEntry = NULL;
-
-	memset(kboot_log_buf, 0, kboot_log_buf_len);
-	pEntry = proc_create_data("boot_dmesg", 0444, NULL, &kboot_fops, NULL);
-	if (!pEntry) {
-		pr_err("failed to make boot_dmesg proc node\n");
-		return -EINVAL;
-	}
-	ubootback_thread = kthread_run(ubootback_thread_fn, NULL, "ubootback_thread");
-	if(IS_ERR(ubootback_thread)) {
-		pr_err("Creating kbootback_thread failed!\n");
-		return -EINVAL;
 	}
 	return 0;
 }
@@ -232,7 +214,6 @@ static int __init oplus_uboot_device_init(void)
 {
 	if (!uboot_kboot_buffer_init()) {
 		register_boot_log_buf();
-		kernel_uboot_log_init();
 
 	}
 	return 0;
