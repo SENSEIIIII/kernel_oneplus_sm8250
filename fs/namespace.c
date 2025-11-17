@@ -146,6 +146,23 @@ retry:
 #endif
 static int mnt_alloc_id(struct mount *mnt)
 {
+	int res;
+
+retry:
+	ida_pre_get(&susfs_mnt_id_ida, GFP_KERNEL);
+	spin_lock(&mnt_id_lock);
+	res = ida_get_new_above(&susfs_mnt_id_ida, susfs_mnt_id_start, &mnt->mnt_id);
+	if (!res)
+		susfs_mnt_id_start = mnt->mnt_id + 1;
+	spin_unlock(&mnt_id_lock);
+	if (res == -EAGAIN)
+		goto retry;
+
+	return res;
+}
+#endif
+static int mnt_alloc_id(struct mount *mnt)
+{
 	int res = ida_alloc(&mnt_id_ida, GFP_KERNEL);
 
 	if (res < 0)
